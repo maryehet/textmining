@@ -1,0 +1,431 @@
+---
+title: "Movie Reviews"
+author: "Mary Eng"
+date: "2023-05-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This is an IMDb data set containing 40000 movie reviews. Each row contains two columns with the text of the review and label. Our goal is to categorize reviews into sentiments and predict genre of the movie the review is about. We will attempt to accomplish this with tidyverse tools, sentiment analysis, tf-idf, correlations of bigrams, and LDA topic modeling. We start by loading in the csv and assign it as the `data` variable.
+```{r}
+data <- read.csv("movie.csv")
+head(data)
+```
+
+## Tidy text format
+First, we tokenize the text into individual tokens with each individual token being a unit of word.
+```{r}
+library(dplyr)
+library(tidytext)
+
+tokens <- data %>% unnest_tokens(output = word, input = text)
+head(tokens)
+```
+Next, we remove stop words.
+```{r}
+library(ggplot2)
+
+data(stop_words) #provided from tidytext
+# remove stop words 
+tidy_data <- tokens %>% anti_join(stop_words)
+# find most common words used in reviews
+tidy_data %>% count(word, sort = TRUE) %>%
+  head(20) %>%
+  # make new variable word
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(n, word)) + geom_col() + labs(y = NULL)
+```
+
+Skimming the top 20 words used in these reviews, we see "br" is the most commonly used word. Upon closer inspect in the data set, "br" refers to html syntax "<br>" or "</br>" to indicate line breaks. Since this is not a valid word, we customly add this to our stop words to remove it from the data set.
+```{r}
+# add br as stop word
+custom_stop_words <- bind_rows(tibble(word = c("br"),  
+                                      lexicon = c("custom")), 
+                               stop_words)
+
+tidy_data <- tokens %>% anti_join(custom_stop_words)
+
+tidy_data %>% count(word, sort = TRUE) %>%
+  head(20) %>%
+  # make new variable word
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(n, word)) + geom_col() + labs(y = NULL)
+```
+
+Knowing this is a data set of movie reviews, it makes sense for the words "movie" and "film" to be the most common words used. 
+
+## Sentiment analysis
+Using the NRC lexicon, we label each word with their assigned sentiment(s), and we plot the distribution from most to least. Note, this visualization is limited because words may have a multiple sentiments. Evaluating words individually, we see the most common sentiment is positive words, but negative as a runner up.
+```{r}
+sent_data <- tidy_data %>% inner_join( get_sentiments("nrc"),
+                                       by='word')
+
+sent_data %>% count(sentiment, sort = TRUE) %>%
+    mutate(sentiment = reorder(sentiment, n)) %>%
+    ggplot(aes(n, sentiment)) + geom_col() + labs(y = NULL)
+
+```
+
+Let's take a closer look into what kind of positive and negative (the top two sentiments) words are most common in the movie reviews. We can use a word cloud to better depict this.
+```{r}
+library(reshape2)
+library(wordcloud)
+
+tidy_data %>%
+  inner_join(get_sentiments("bing")) %>%
+  count(word, sentiment, sort = TRUE) %>%
+  # acast() turns the data frame into a matrix
+  # The cast formula has the following format: x_variable + x_2 ~ y_variable + y_2 ~ z_variable ~ ... The order of the variables makes a difference. The first varies slowest, and the last fastest.
+  # value.var is the name of column which stores values
+  acast(formula = word ~ sentiment, value.var = "n", fill = 0) %>%
+  comparison.cloud(colors = c("red3", "skyblue"), max.words = 100)
+```
+
+## Analyzing word and document frequency: tf-idf
+To closer analyze what a document is about, we take a look into the word frequencies. We first verify Zipf's Law holds, which states the frequency that a word appears is inversely proportional to its rank of frequency.
+```{r}
+len <- dim(tidy_data)[1]
+
+freq_by_rank <- tidy_data %>% 
+  count(word, sort = TRUE) %>%
+  mutate(rank = row_number(), 
+         `term frequency` = n/len) 
+
+head(freq_by_rank)
+```
+```{r}
+freq_by_rank %>% 
+  ggplot(aes(rank, `term frequency`)) + 
+  geom_line(size = 1.1, alpha = 0.8, show.legend = FALSE) + 
+  scale_x_log10() + scale_y_log10() 
+
+```
+
+The plot shows the movie reviews do follow a linear rank-frequency relationship. Next, considering every review as a separate document, we can analyze the tf-idf.
+```{r}
+data$doc <- c(1: dim(data)[1] )
+
+review_words <- data %>% unnest_tokens(output = word, input = text) %>% 
+  count(doc, word, sort = TRUE)
+
+total_words <- review_words %>% 
+  group_by(doc) %>% 
+  summarize(total = sum(n))
+
+review_words <- left_join(review_words, total_words)
+
+head(review_words)
+```
+```{r} 
+tf_idf <- review_words %>%
+  bind_tf_idf(term = word, document = doc, n=n)
+
+ordered_tf_idf <- tf_idf %>%
+  select(-total) %>%
+  arrange(desc(tf_idf))
+
+head(ordered_tf_idf)
+```
+The most important word appear to be "trivialboring", looking at the data set, the word appears to be copy and pasted 26 times in review number 18348.
+The term "stop.oz" seems to be important, but about closer examination at the document with the word, that review appears to have the sentence "OZ is the greatest show ever mad full stop.OZ is the greatest show ever mad full stop." repeated 23 times, so that is not a good review. "Cognac" was also from a review that had the same sentence 12 times. Because of the corrections needed to be made on these results, id-tdf is probably not the most reliable method for finding important words in the data set. 
+
+## Relationships between words: n-grams and correlations
+We can also tokenize by n-grams, which are consecutive sequences of n words. Something to note is that tokenizing in this way will result in overlapping tokens.
+```{r}
+movie_bigrams <- data %>% unnest_tokens(bigram, text, token = "ngrams", n = 2) %>%
+  filter(!is.na(bigram))
+
+head(movie_bigrams)
+```
+To remove any bigrams with stop words and find the most common bigrams, we count the words not included in the stop words.
+```{r}
+library(tidyr)
+
+bigrams_separated <- movie_bigrams %>%
+  # separate the bigram column in word1 and word2 columns separating by a space
+  separate(col = bigram, into = c("word1", "word2"), sep = " ")
+
+# remove stop words
+bigrams_filtered <- bigrams_separated %>%
+  filter(!word1 %in% custom_stop_words$word) %>%
+  filter(!word2 %in% custom_stop_words$word)
+
+# new bigram counts:
+bigram_counts <- bigrams_filtered %>% 
+  count(word1, word2, sort = TRUE)
+
+head(bigram_counts)
+```
+```{r}
+bigrams_united <- bigrams_filtered %>%
+  unite(col = bigram, c(word1, word2), sep = " ")
+
+head(bigrams_united)
+```
+Looking into negated words:
+```{r}
+AFINN <- get_sentiments("afinn")
+
+not_words <- bigrams_separated %>%
+  filter(word1 == "not") %>%
+  inner_join(AFINN, by = c(word2 = "word")) %>%
+  count(word2, value, sort = TRUE)
+
+not_words %>%
+  mutate(contribution = n * value) %>%
+  arrange(desc(abs(contribution))) %>%
+  head(20) %>%
+  mutate(word2 = reorder(word2, contribution)) %>%
+  ggplot(aes(n * value, word2, fill = n * value > 0)) +
+  geom_col(show.legend = FALSE) +
+  labs(x = "Sentiment value * number of occurrences",
+       y = "Words preceded by \"not\"")
+
+```
+
+Not funny" appears to be the most negated positive word in these reviews, and "not bad" is the most negated negative word in reviews. 
+
+To visualize more pairings of words simultaneously, we can use a network of nodes.
+```{r}
+library(igraph)
+library(ggraph)
+
+bigram_graph <- bigram_counts %>%
+  head(80) %>%
+  # Create igraph graph object from data frame
+  graph_from_data_frame()
+
+bigram_graph <- bigram_counts %>%
+  head(80) %>%
+  # Create igraph graph object from data frame
+  graph_from_data_frame()
+
+set.seed(7)
+a <- grid::arrow(type = "closed", length = unit(.15, "inches"))
+
+ggraph(bigram_graph, layout = "fr") +
+  # edge_alpha to make links transparent based on how common or rare the bigram is
+  geom_edge_link(aes(edge_alpha = n), show.legend = FALSE,
+                 # end_cap option tells arrow to end before touching next node
+                 arrow = a, end_cap = circle(.07, 'inches')) +
+  geom_node_point(color = "lightblue", size = 5) +
+  geom_node_text(aes(label = name), vjust = 1, hjust = 1) +
+  # add theme for plotting networks
+  theme_void()
+```
+
+If we were interested in words that occur within the same documents but are not adjacent to each other, we can take the count and correlations of pairs of words.
+```{r}
+library(widyr)
+
+words <- data %>% unnest_tokens(output = word, input = text)
+
+word_pairs <- words %>%
+  filter(!word %in% custom_stop_words$word) %>%
+  pairwise_count(item = word, feature = doc, sort = TRUE)
+
+head(word_pairs)
+```
+```{r}
+word_cors <- words %>%
+  filter(!word %in% custom_stop_words$word) %>%
+  group_by(word) %>%
+  filter(n() >= 1000) %>%
+  pairwise_cor(word, doc, sort = TRUE)
+
+head(word_cors)
+```
+We can graph these highly correlated words with the correlation as weights.
+```{r}
+set.seed(2016)
+
+word_cors %>%
+  filter(correlation > .15) %>%
+  graph_from_data_frame() %>%
+  ggraph(layout = "fr") +
+  geom_edge_link(aes(edge_alpha = correlation), show.legend = FALSE) +
+  geom_node_point(color = "lightblue", size = 5) +
+  geom_node_text(aes(label = name), repel = TRUE) +
+  theme_void()
+```
+
+## Topic modeling
+Now, we will try to use topic modeling to group the reviews into movie genres the review was for. We first need to convert tidy format to a document-term matrix object that the `topicmodels` package takes as input. 
+```{r}
+library(topicmodels)
+
+words_dtm <- words %>% 
+  filter(!word %in% custom_stop_words$word) %>%
+  count(doc, word, sort = TRUE) %>%
+  cast_dtm(doc, word, n)
+
+head(words_dtm)
+```
+Next, we use Latent Dirichlet allocation (LDA) algorithm to estimate the mixture of words associated with k topics. We start with an arbitrary low k value of 4.
+```{r}
+lda <- LDA(words_dtm, k = 4, control = list(seed = 1234))
+
+topics <- tidy(lda, matrix = "beta")
+
+head(topics)
+```
+```{r}
+top_terms <- topics %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 10) %>% 
+  ungroup() %>%
+  arrange(topic, -beta)
+
+top_terms %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(beta, term, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  scale_y_reordered()
+```
+
+It appears that every topic includes the usage of "movie" and "film," which isn't too helpful in distinguishing topics. What if we didn't include those two words in the clustering?
+```{r}
+words_dtm <- words %>% 
+  filter(!word %in% custom_stop_words$word) %>%
+  filter(!word %in% c("movie", "movies", "film", "films")) %>%
+  count(doc, word, sort = TRUE) %>%
+  cast_dtm(doc, word, n)
+
+lda <- LDA(words_dtm, k = 6, control = list(seed = 1234))
+
+topics <- tidy(lda, matrix = "beta")
+
+top_terms <- topics %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 20) %>% 
+  ungroup() %>%
+  arrange(topic, -beta)
+
+top_terms %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(beta, term, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  scale_y_reordered()
+```
+
+We still see redundant terms for words sharing the same root, such as "acting" and "actor." To discover more informative terms from these review, we map all words to their stem and perform the LDA algorithm on the stem words with the `SnowballC` package.
+```{r}
+library(SnowballC)
+
+stem_words <- words %>%
+  filter(!word %in% custom_stop_words$word) %>%
+  mutate(stem = wordStem(word))
+
+stem_counts <- stem_words %>% 
+  count(stem, sort = TRUE)
+
+head(stem_counts)
+```
+
+After running LDA with different k values from 2 to 10, the results for k = 6 topics looked the most distinct from each other. 
+```{r}
+words_dtm <- stem_words %>%
+  filter(!word %in% c("movie", "movies", "film", "films")) %>%
+  count(doc, stem, sort = TRUE) %>%
+  cast_dtm(doc, stem, n)
+
+lda <- LDA(words_dtm, k = 6, control = list(seed = 1234))
+
+topics <- tidy(lda, matrix = "beta")
+
+top_terms <- topics %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 20) %>% 
+  ungroup() %>%
+  arrange(topic, -beta)
+
+top_terms %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(beta, term, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  scale_y_reordered()
+```
+
+We can also examine the per-document-per-topic probabilities (gamma), the estimated proportion of words from that document that are generated from that topic. We can then assign a topic to each review.
+```{r}
+reviews_gamma <- tidy(lda, matrix = "gamma")
+head(reviews_gamma)
+```
+We could take the original document-word pairs and find which words in each document were assigned to which topic. The `augment()` function from the broom package is a way of tidying model output. We see the output is a tidy data frame with review-word counts with the topic each word was assigned to. 
+```{r}
+assignments <- augment(lda, data = words_dtm)
+head(assignments)
+```
+```{r}
+#count how many reviews for each topic
+topic_counts <- assignments %>% 
+  group_by(.topic) %>%  
+  summarise(sum_count = sum(count),
+            .groups = 'drop')
+
+topic_counts
+```
+```{r}
+topic_counts %>%
+  ggplot(aes(x=.topic, y=sum_count)) +
+  geom_bar(stat="identity")
+```
+
+There appears to be about equal amount of reviews for each topic. To get a better idea of what genres these topics correspond to, we can further look into the words of each topic.genre to see what kinds of sentiments are expressed in these reviews. One thing to note is by using the BING lexicon to analyze word sentiments, there are many words not categorized, so there is a significant drop in data entries, but the most commonly used words should still show. Using wordclouds to visualize the most prominent words, the hypothesized genres of each topic are:
+```{r}
+# assign sentiment to each term in assignments, note row count drops from 2,784,478 to 363,404 as there are many words in the reviews not included in the lexicon.
+assign_topics <- assignments %>% inner_join(get_sentiments("bing"), by=c('term'='word'))
+
+gen_cloud <- function(topic) {
+ topic_sub <- subset( assign_topics , .topic == topic )
+ topic_sub %>% group_by(term) %>% 
+   summarise(count = sum(count)) %>%  
+   inner_join(get_sentiments("bing"), by=c('term'='word')) %>%
+   acast(formula = term ~ sentiment, value.var = "count", fill = 0) %>%
+   comparison.cloud(colors = c("red3", "skyblue"), max.words = 100)
+}
+```
+
+Topic 1: dystopian/science fiction
+```{r}
+gen_cloud(1)
+```
+
+Topic 2: drama
+```{r}
+gen_cloud(2)
+```
+
+Topic 3: romantic-comedy
+```{r}
+gen_cloud(3)
+```
+
+Topic 4: horror
+```{r}
+gen_cloud(4)
+```
+
+Topic 5: war/historical fiction
+```{r}
+gen_cloud(5)
+```
+
+Topic 6: comedy/action
+```{r}
+gen_cloud(6)
+```
+
+## Limitations
+There was a loss in information from inner joining with sentiment lexicons, because lexicons that were created earlier do not contain all modern words and we also could not guarantee all words in the reviews were spelled correctly either. Another limitation of this survey is the lack of method to check if our assigned genres matched with the actual genre of the movie the review was about. The original data set included a binary "label" column, but we concluded it is not very informative, because there are realistically more than two types of movie genres. Because this is an unsupervised learning analysis, we can only make inferences based on our results but can't check the accuracy. Even so, movies are realistically tagged as multiple genres, so a discrete grouping would not be the most accurate. 
+
+Another limitation is the large size of data set can be computationally costly. Most of the exhibited code ran within a couple minutes, but generating the bigrams sections had a notably higher run time of around 20 minutes. Overall, these results show this methodology can be used to an extent to predict genre. 
+
+
+
