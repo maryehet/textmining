@@ -1,0 +1,143 @@
+---
+title: "Text Mining with R"
+author: "Mary Eng"
+date: "2023-05-03"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This overview is adapted from [ _Text Mining with R: A Tidy Approach_  ](https://www.tidytextmining.com/index.html) by Julia Silge and David Robinson.
+
+## 5: Converting to and from non-tidy formats
+So far, we have been using the tidy text format to process text, where each token is a row in a table. This format can be easily pipelined into dplyr, tidyr, and ggplot2 packages for fundamental data exploration and vizualization. However, many other R tools for natural language processing use other formats, so we need an effective way to switch between formats to be able to use a larger variety of analyses.    
+
+### Tidying a document-term matrix
+Many other text mining packages use a structure called document-term matrix (DTM). Here, each row represents one entire document, each column is a term, and each (row, col) entry contains the number of times the term appeared in the document. Because this structure results in many zero entries, DTMs are often implemented as sparse matrices. 
+
+DTMs can't be directly used with tidy tools, but we have functions to convert between DTMs and tidy data frames: `tidy()` from the `broom` package, which turns a DTM into a tidy data frame and `cast()`, which converts a tidy data frame into a matrix. Other variations of the latter include `cast_sparse()`, `cast_dtm()`, and `cast_dfm()`.
+
+One of the most widely used implementations of DTMs in R is with the `tm` package. Let's use the collection of Associated Press newspaper articles from the `topicmodels` package.
+```{r}
+library(tm)
+
+data("AssociatedPress", package = "topicmodels")
+AssociatedPress
+```
+This object has 2246 documents (rows) and 10473 terms (columns). The 99% sparsity means that 99% of the document-word pairs are zeros. To access the terms/columns in the document, we use the `Term()` function. 
+```{r}
+terms <- Terms(AssociatedPress)
+head(terms)
+```
+If we were to input this data into tidy tools, we would have to turn it into a data frame with one token per row. The `broom` package has a handy `tidy()` function for this purpose. Something to note is that the words that don't appear in a document (has a zero entry) are not included in this tidy data frame. This is also similar to the `melt()` function from `reshape2` package for non-sparse matrices.
+```{r}
+library(dplyr)
+library(tidytext)
+
+#turn non-tidy object into tidy object
+ap_td <- tidy(AssociatedPress)
+ap_td
+```
+Now, we can carry on with our familiar analysis in tidyverse, such as sentiment analysis. 
+```{r}
+library(ggplot2)
+
+ap_sentiments <- ap_td %>%
+  inner_join(get_sentiments("bing"), by = c(term = "word"))
+
+ap_sentiments %>%
+  count(sentiment, term, wt = count) %>%
+  ungroup() %>%
+  filter(n >= 200) %>%
+  mutate(n = ifelse(sentiment == "negative", -n, n)) %>%
+  mutate(term = reorder(term, n)) %>%
+  ggplot(aes(n, term, fill = sentiment)) +
+  geom_col() +
+  labs(x = "Contribution to sentiment", y = NULL)
+```
+
+There are also additional data structures for storing text data apart from tidy text and DFMs. As an example, we use the `quanteda` package which includes a corpus of presidential inauguration speeches and has it's own implementation to convert into a DFM.  
+```{r}
+data("data_corpus_inaugural", package = "quanteda")
+# convert corpus to DFM
+inaug_dfm <- data_corpus_inaugural %>%
+  quanteda::tokens() %>%
+  quanteda::dfm(verbose = FALSE)
+inaug_dfm
+```
+Once a DFM, the `tidy()` method can be used. If we were interested in the finding the most specific words in each speech, we can calculate the tf-idf of each term in each document. 
+```{r}
+inaug_td <- tidy(inaug_dfm)
+
+inaug_tf_idf <- inaug_td %>%
+  bind_tf_idf(term, document, count) %>%
+  arrange
+
+inaug_tf_idf
+```
+
+To visualize how some words changed in frequency over time, we can use `tidyr`. 
+```{r}
+library(tidyr)
+
+year_term_counts <- inaug_td %>%
+  extract(document, "year", "(\\d+)", convert = TRUE) %>%
+  # fill zeros in the table
+  complete(year, term, fill = list(count = 0)) %>%
+  group_by(year) %>%
+  mutate(year_total = sum(count))
+
+year_term_counts %>%
+  filter(term %in% c("god", "america", "foreign", "union", "constitution", "freedom")) %>%
+  ggplot(aes(year, count / year_total)) +
+  geom_point() +
+  geom_smooth() +
+  facet_wrap(~ term, scales = "free_y") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(y = "% frequency of word in inaugural address")
+```
+
+Over time, American presidents are less likely to refer to the country as the “Union” and more likely to refer to “America”. They also became less likely to talk about the “constitution” and "foreign” countries, and more likely to mention “freedom” and “God”.
+
+Even if data was not given in a tidy format, we can easily cast the objects to tidy data frames with a couple functions.
+
+### Casting tidy text data to a matrix
+To convert from tidy format to a DFM or matrix, we can use the `cast_()` functions provided by `tidytext`. 
+```{r}
+# tidy data -> DTM
+ap_td %>%
+  cast_dtm(document, term, count)
+```
+```{r}
+# tidy table -> dfm 
+ap_td %>%
+  cast_dfm(document, term, count)
+```
+To cast into sparse matrix, we can:
+```{r}
+library(Matrix)
+# cast to a Matrix object
+m <- ap_td %>%
+  cast_sparse(document, term, count)
+
+class(m)
+```
+### Tidying corpus objects
+Corpus objects are data structures that store document collections before tokenization. The `Corpus` object from the `tm` package stores text alongside additional metadata, such as ID, timestamp, language for each document.
+```{r}
+data("acq") #data from tm package
+acq
+```
+This acq corpus object contains 50 documents from the news service Reuters. It is structured like a list, where each item contains both text and metadata. The `tidy()` function can still be used on this format and it will include the metadata as columns along with the text.
+```{r}
+acq_td <- tidy(acq)
+acq_td
+```
+
+Corpus objects are a common output format for packages, but they can still be used in tidy tools.
+
+

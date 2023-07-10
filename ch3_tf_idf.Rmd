@@ -1,0 +1,213 @@
+---
+title: "Text Mining with R"
+author: "Mary Eng"
+date: "2023-05-03"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This overview is adapted from [ _Text Mining with R: A Tidy Approach_  ](https://www.tidytextmining.com/index.html) by Julia Silge and David Robinson.
+
+## 3: Analyzing word and document frequency: tf-idf
+To analyze what a document is about, we take a closer look into the word frequencies. One useful measure is term frequency (tf), which is how frequently a word occurs in a document. We have previously handled common words with little words as stop words, but there may be cases where some stop words have more importance than others. As an alternative, we can also look at a term's inverse document frequency (idf), where commonly used words have decreased weight and uncommon ones have increased weight. The idf is defined as: 
+$$idf(term) = ln( \frac{n_{\,documents\ }}{n_{ \,documents\ \,containing\ term}} )$$
+
+Multiplying the tf and idf measures together, we get tf-idf, which represents the frequency of a term adjusted for how rarely it is used. In other words, tf-idf can be used to quantify how important a word is in the document. 
+
+### Zipf's Law
+Let's first revisit the word counts of Jane Austen's novels.
+```{r}
+library(dplyr)
+library(janeaustenr)
+library(tidytext)
+
+#get count of every word in every book sorted by highest words
+book_words <- austen_books() %>%
+  unnest_tokens(word, text) %>%
+  count(book, word, sort = TRUE)
+# get count of total words in each book
+total_words <- book_words %>% 
+  group_by(book) %>% 
+  summarize(total = sum(n))
+# left join on book to add column of total word counts to each word in each book 
+book_words <- left_join(book_words, total_words)
+
+book_words
+```
+
+Here we did not filter out the stop words as we did previously, so it makes sense the most commonly used words in each book are "the", "to", and "and". To get the term frequency (tf), we calculate n/total. We then make a histogram of the calculated term frequencies to see the distribution of tf's in each book.
+
+```{r}
+library(ggplot2)
+
+ggplot(book_words, aes(n/total, fill = book)) +
+  geom_histogram(show.legend = FALSE) +
+  xlim(NA, 0.0009) +
+  facet_wrap(~book, ncol = 2, scales = "free_y")
+```
+
+From these plots, we see there are many words that occur in very low frequencies and fewer words that occur in high frequencies. These distributions with long tails are common in languages. A term to describe this relationship is Zipf's law.
+
+Zipf’s law states that the frequency that a word appears is inversely proportional to its rank of frequency. 
+```{r}
+freq_by_rank <- book_words %>% 
+  group_by(book) %>% 
+  mutate(rank = row_number(), 
+         `term frequency` = n/total) %>%
+  ungroup()
+
+freq_by_rank
+```
+
+Another way to visualize Zipf's law is by plotting the log(rank) against the respective log(frequency), displaying a inversely proportional relationship with negative slope. 
+```{r}
+freq_by_rank %>% 
+  ggplot(aes(rank, `term frequency`, color = book)) + 
+  geom_line(size = 1.1, alpha = 0.8, show.legend = FALSE) + 
+  scale_x_log10() +
+  scale_y_log10()
+```
+
+It appears all six of the Austen novels follow the same almost linear rank-frequency relationship.
+
+### tf-idf
+Tf-idf is used to measure importance of words in a document by  decreasing the weight of common words and increasing the weight of uncommon ones. Tf-idf can be used to find words that are common and important but not too common. 
+
+From the tidytext package, we can use the `bind_tf_idf()` function to calucate the tf, idf, and tf-idf of a tidytext dataset by specifying the column in the dataframe with the term, document, and counts. 
+```{r}
+book_tf_idf <- book_words %>%
+  bind_tf_idf(term = word, document = book, n=n)
+
+book_tf_idf
+```
+
+The idf and tf-idf is 0 for very common words because they are words that appear in all of Austen's novels, so the idf term is the log of 1 which is 0. Following that logic, the idf and tf-idf are near 0 value for words that appear in most of the books in the collection. Therefore, the idf increases for words that occur in fewer books. This is how the weight of very common words is reduced. 
+
+We can next take a closer look into words with high tf-idf. 
+```{r}
+book_tf_idf %>%
+  select(-total) %>%
+  arrange(desc(tf_idf))
+```
+
+Here all the main character names of each novel have high importance as evident. 
+
+```{r}
+# library for Working with Categorical Variables
+library(forcats)
+
+book_tf_idf %>%
+  group_by(book) %>%
+  slice_max(tf_idf, n = 15) %>%
+  ungroup() %>%
+                    #reorder factor levels by sorting along another var
+  ggplot(aes(tf_idf, fct_reorder(word, tf_idf), fill = book)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~book, ncol = 2, scales = "free") +
+  labs(x = "tf-idf", y = NULL)
+```
+
+
+From the plots, proper noun names are the most important words of each novel. We can conclude that Austen used similar words across her six books, but what distinguishes one novel from the rest are the proper nouns of the characters. Overall, the main takeaway from tf-idf is to identify words that are important to one document within a collection of documents.
+
+### Physics Texts Example
+As another example, let's look at a different genre of documents: classic physics text over span of 300 years. From the Project Gutenberg package, we have access to *Discourse on Floating Bodies* by Galileo Galilei, _Treatise on Light_ by Christiaan Huygens, _Experiments with Alternate Currents of High Potential and High Frequency_ by Nikola Tesla, and _Relativity: The Special and General Theory_ by Albert Einstein. These texts include works that were translated into English.
+```{r}
+library(gutenbergr)
+physics <- gutenberg_download(c(37729, 14725, 13476, 30155), 
+                              meta_fields = "author")
+# get word counts of every word in each text sorted by most common
+physics_words <- physics %>%
+  unnest_tokens(word, text) %>%
+  count(author, word, sort = TRUE)
+
+physics_words
+```
+
+Next we calculate the tf-idf and visualize the word with high tf-idf  values.
+```{r}
+plot_physics <- physics_words %>%
+  bind_tf_idf(word, author, n) %>%
+  mutate(author = factor(author, levels = c("Galilei, Galileo",
+                                            "Huygens, Christiaan", 
+                                            "Tesla, Nikola",
+                                            "Einstein, Albert")))
+
+plot_physics %>% 
+  group_by(author) %>% 
+  slice_max(tf_idf, n = 15) %>% 
+  ungroup() %>%
+  mutate(word = reorder(word, tf_idf)) %>%
+  ggplot(aes(tf_idf, word, fill = author)) +
+  geom_col(show.legend = FALSE) +
+  labs(x = "tf-idf", y = NULL) +
+  facet_wrap(~author, ncol = 2, scales = "free")
+```
+
+A couple notable anomalies are "_k_", "_k", "co", "_x" in Einstein's work. The `unnest_tokens()` function separates around punctuation, including hyphens by default. This is a good indicator that we should do additional cleaning on the documents.
+```{r}
+library(stringr) #package for string processing
+# find occurences of "_k_"
+physics %>% 
+  filter(str_detect(text, "_k_")) %>% 
+  select(text)
+```
+
+There also seems to be a lot of notational words, such as "AB" and "RC" that are used for naming mathematical objects in physics context. We can compile a custom stop word list and remove them with `anti_join` as we have previously done.  
+```{r}
+mystopwords <- tibble(word = c("eq", "co", "rc", "ac", "ak", "bn", 
+                                   "fig", "file", "cg", "cb", "cm",
+                               "ab", "_k", "_k_", "_x"))
+
+physics_words <- anti_join(physics_words, mystopwords, 
+                           by = "word")
+
+plot_physics <- physics_words %>%
+  bind_tf_idf(word, author, n) %>%
+  mutate(word = str_remove_all(word, "_")) %>%
+  group_by(author) %>% 
+  slice_max(tf_idf, n = 15) %>%
+  ungroup() %>%
+  mutate(word = fct_reorder(word, tf_idf)) %>%
+  mutate(author = factor(author, levels = c("Galilei, Galileo",
+                                            "Huygens, Christiaan",
+                                            "Tesla, Nikola",
+                                            "Einstein, Albert")))
+```
+We can further see the distribution of the tf-idf's by plotting them.
+```{r}
+ggplot(plot_physics, aes(tf_idf, word, fill = author)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~author, ncol = 2, scales = "free") +
+  labs(x = "tf-idf", y = NULL)
+```
+
+Compared to Jane Austen's fictional works, the important words with highest tf-idf are vastly different in nonfictional context. 
+
+Plotting the term frequency against rank, we see Zipf's law still holds for the collection of texts.
+```{r}
+total_physics_words <- physics_words %>% 
+  group_by(author) %>% 
+  summarize(total = sum(n))
+
+total_physics_words <- left_join(physics_words, total_physics_words)
+
+physics_rank <- total_physics_words %>% 
+  group_by(author) %>% 
+  mutate(rank = row_number(), 
+         `term frequency` = n/total) %>%
+  ungroup()
+
+physics_rank %>% 
+  ggplot(aes(rank, `term frequency`, color = author)) + 
+  geom_line(size = 1.1, alpha = 0.8, show.legend = FALSE) + 
+  scale_x_log10() +
+  scale_y_log10()
+```
+
+In summary, term frequency (tf) and inverse document frequency (idf) are reliable metrics to analyze the important words of a given document. Different document contexts may require more processing and cleaning to product useful insights.

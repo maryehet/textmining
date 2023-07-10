@@ -1,0 +1,163 @@
+---
+title: "Text Mining with R"
+author: "Mary Eng"
+date: "2023-05-03"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This overview is adapted from [ _Text Mining with R: A Tidy Approach_  ](https://www.tidytextmining.com/index.html) by Julia Silge and David Robinson.
+
+## 2: Sentiment analysis with tidy data
+
+After we understand how text is processed as units, we can look into opinion mining or sentiment analysis. Words can mean different things depending on the context, so emotion is an important characterization of in text analysis. 
+![text analysis process](textmining2.png)
+
+One common approach to sentiment analysis is to consider the sentiment content of the whole text as the sum of the sentiment content of its individual words. The tidytext package provides sentiment lexicons. These lexicons were compiled from crowdsourcing or by the author's labor which was validated with crowdsourcing, reviews, or Twitter data. Included lexicons have different licenses, so users have to agree with the license of a lexicon before downloading it.
+
+The AFINN lexicon assigns words with a score that runs between -5 and 5, with negative scores indicating negative sentiment and positive scores indicating positive sentiment.
+```{r}
+library(dplyr)
+library(tidytext)
+library(janeaustenr)
+library(stringr)
+library(gutenbergr)
+# get specific sentiment lexicon with the appropriate measures for each one.
+get_sentiments("afinn") 
+```
+The bing lexicon categorizes words in a binary fashion into positive and negative categories.
+```{r}
+get_sentiments("bing")
+```
+The NRC lexicon categorizes words in a binary fashion (“yes”/“no”) into categories of positive, negative, anger, anticipation, disgust, fear, joy, sadness, surprise, and trust. 
+```{r}
+get_sentiments("nrc")
+```
+
+### Sentiment analysis with inner join
+For example, we want to look into words with a joy score from NRC lexicon and find the most common joy words in *Emma*. We first convert the text to tokens as before. Then we filter the NRC lexicon for joy words and inner join with words in *Emma*. 
+```{r}
+tidy_books <- austen_books() %>%
+  group_by(book) %>%
+  mutate(
+    linenumber = row_number(),
+    chapter = cumsum(str_detect(text, 
+                                regex("^chapter [\\divxlc]", 
+                                      ignore_case = TRUE)))) %>%
+  ungroup() %>% unnest_tokens(word, text)
+
+nrc_joy <- get_sentiments("nrc") %>% filter(sentiment == "joy")
+
+tidy_books %>% filter(book == "Emma") %>%           
+  inner_join(nrc_joy) %>% count(word, sort = TRUE) 
+```
+Here, we see the count of the most common joy words in the book. We can also count up how many positive and negative words are in sections of each Jane Austen book to see how sentiment changes throughout the books. We don't want too small or too big sections because the sentiment may not be accurately represented. A good size is 80 lines, but the size of the section varies by text. We define an index that counts every 80 lines of text and plot the sentiment scores.
+```{r}
+# get sentiment scores and expand out the positive and negative sentiment columns
+jane_austen_sentiment <- tidy_books %>%
+  inner_join(get_sentiments("bing")) %>%
+  count(book, index = linenumber %/% 80, sentiment) %>%
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>%   mutate(sentiment = positive - negative)
+# plot sentiment scores
+ggplot(jane_austen_sentiment, aes(index, sentiment, fill = book)) +
+  geom_col(show.legend = FALSE) + 
+  facet_wrap(~book, ncol = 2, scales = "free_x") 
+```
+
+### Common Positive and Negative Words
+Homonyms and connotations add an additional layer of complexity when evaluating words. We can further analyze words that contribute to each sentiment.
+```{r}
+bing_word_counts <- tidy_books %>%
+  inner_join(get_sentiments("bing")) %>%
+  count(word, sentiment, sort = TRUE) %>% ungroup()
+
+bing_word_counts
+
+bing_word_counts %>%
+  group_by(sentiment) %>% slice_max(n, n = 10) %>% 
+  ungroup() %>% mutate(word = reorder(word, n)) %>%
+  ggplot(aes(n, word, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free_y") +
+  labs(x = "Contribution to sentiment",
+       y = NULL)
+```
+
+Here it looks like "miss" was the most common negative word used, but in Jane Austen's works, it is referring to the title for young unmarried women. To account for this outlier, we can customly add "miss" to the stop words used for this text.
+```{r}
+custom_stop_words <- bind_rows(tibble(word = c("miss"),  
+                                      lexicon = c("custom")), 
+                               stop_words)
+custom_stop_words
+```
+### Lexicon Limitations
+Not all English words are included in the lexicons because many words have a neutral meaning. In addition, lexicons do not take into account of phrases and qualifiers, such as "not good" because they evaluate isolated words. Another note to keep in mind in the case of analyzing older works is that because of the nature the lexicons were made from crowd sourcing and works of modern language, the sentiment lexicons may not be the best fit for older texts. 
+
+### Word Clouds
+In addition to bar graphs, we can also visualize frequencies of words in a word cloud. One advantage is that you can show more words in a word cloud than on a regular bar graph. The size of a word’s text is proportional to its frequency. 
+```{r}
+library(wordcloud)
+
+tidy_books %>%
+  anti_join(stop_words) %>% count(word) %>% 
+  # with(df, expr) evaluates the expression without altering the original df
+  with(wordcloud(word, n, max.words = 100)) 
+```
+
+
+There is also an `comparison.cloud()` function where you can turn a dataframe into a matrix. Then you can plot the most common positive and negative words in the word cloud. 
+```{r}
+library(reshape2)
+
+tidy_books %>%
+  inner_join(get_sentiments("bing")) %>%
+  count(word, sentiment, sort = TRUE) %>%
+  # acast() turns the data frame into a matrix
+  # The cast formula has the following format: x_variable + x_2 ~ y_variable + y_2 ~ z_variable ~ ... The order of the variables makes a difference. The first varies slowest, and the last fastest.
+  # value.var is the name of column which stores values
+  acast(formula = word ~ sentiment, value.var = "n", fill = 0) %>%
+  comparison.cloud(colors = c("gray20", "gray80"), max.words = 100)
+```
+
+When visualizing multiple sentiments, the size of a word’s text is only proportional to its frequency within its sentiment, not between different sentiments.
+
+### Looking at units beyond just words
+Sometimes it is more useful at looking at different units of text, such as understanding the sentiment of an entire sentence. Tokens can also be split by regex patterns.
+```{r}
+p_and_p_sentences <- tibble(text = prideprejudice) %>% 
+  unnest_tokens(sentence, text, token = "sentences")
+p_and_p_sentences$sentence[7]
+```
+As an example, let's analyze negative sentiments from the bing lexicon.
+```{r}
+# get negative sentiment lexicon from bing lexicon
+bingnegative <- get_sentiments("bing") %>% 
+  filter(sentiment == "negative")
+
+wordcounts <- tidy_books %>%
+  group_by(book, chapter) %>%
+  # n() counts number of observations in group
+  summarize(words = n())
+
+tidy_books %>%
+  # semi_join is like inner join but returns all columns from the left df and ignores all columns from the right dataset
+  semi_join(bingnegative) %>%
+  group_by(book, chapter) %>%
+  summarize(negativewords = n()) %>%
+  left_join(wordcounts, by = c("book", "chapter")) %>%
+  mutate(ratio = negativewords/words) %>%
+  filter(chapter != 0) %>%
+  # slice_max select n rows with highest values of a variable 
+  slice_max(ratio, n = 1) %>% 
+  ungroup()
+```
+
+
+
+
+

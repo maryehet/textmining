@@ -1,0 +1,275 @@
+---
+title: "Text Mining with R"
+author: "Mary Eng"
+date: "2023-05-03"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This overview is adapted from [ _Text Mining with R: A Tidy Approach_  ](https://www.tidytextmining.com/index.html) by Julia Silge and David Robinson.
+
+## 6: Topic modeling
+We have been analyzing text documents that all share a theme or are in the same group. However, in text mining, we usually have larger collections of multiple unsorted documents. Topic modeling can be used to cluster documents into group in an unsupervised classification method. 
+
+A popular method for topic modeling is Latent Dirichlet Allocation (LDA). This method treats each document as a mixture of topics, and each topic as a mixture of words. Documents would have similar topics to other documents in an overlapping manner that more accurately reflects natural languages and not in discrete groups. 
+
+Adding topic modeling to our text analysis flowchart, we see topic modeling can be done on Document-Term Matrices to produce a model that can be used by tidytext and tidytools. We will be using the `topicmodels` package to illustrate examples. 
+![text analysis process with topic modeling](text_flow.png)
+
+### Latent Dirichlet allocation (LDA)
+LDA is one of the most common algorithms for topic modeling. We think of each document as a mixture of topics and each may have words from several topics of different proportions. In a two-topic model example, we could say “Document 1 is 90% topic A and 10% topic B, while Document 2 is 30% topic A and 70% topic B.” Every topic is considered a mixture of words. For example, the topic for "politics" may have common words such as “President”, “Congress”, and “government” and the topic for "entertainment" can be associated with words such as “movies”, “television”, and “actor." However, both topics may contain an overlapping words like "budget" that might appear in both topics equally. 
+
+LDA is a mathematical method for estimating the mixture of words associated with a topic and which topics best describes a document. We can use the `LDA()` function from the topicmodels package and set k = 2 to create a two-topic LDA model. Most topic models in practice will use a larger k, but we will start with a simpler case. The output is an object containing model fit details, such as how words are associated with topics and how topics are associated with documents.
+```{r}
+library(topicmodels)
+# collection of 2246 news articles from an American news agency, mostly published around 1988
+data("AssociatedPress")
+                             # k = num of topics, set seed so output is predictable
+ap_lda <- LDA(AssociatedPress, k = 2, control = list(seed = 1234))
+ap_lda
+```
+
+### Word-topic probabilities
+The `tidytextt` package also provides a `tidy()` method for extracting per-topic-per-word probabilities ($\beta$) from the model in a tidy one item per row format.
+```{r}
+library(tidytext)
+
+ap_topics <- tidy(ap_lda, matrix = "beta")
+ap_topics
+```
+For each term in every topic, the $\beta$ value is the probability of that term being generated from that topic. To better visualize the 10 most common terms in each topic, we can input into ggplot2.
+```{r}
+library(ggplot2)
+library(dplyr)
+
+ap_top_terms <- ap_topics %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 10) %>% 
+  ungroup() %>%
+  arrange(topic, -beta)
+
+ap_top_terms %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(beta, term, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  scale_y_reordered()
+```
+
+The most common words in topic 1 are “percent”, “million”, “billion”, and “company”, which suggests this topic may be relating to business or financial news. The most common terms in topic 2 include “president”, “government”, and “soviet”, suggesting that this topic represents political news. An important observation is that the same words may appear in multiple topics, such as "new" and "people." This allows for more flexible and accurate clustering because terms don't have to only indicate one topic. 
+
+As another approach, we could only consider the terms that had the greatest difference in beta between topic 1 and 2, which can be estimated based on the log ratio of the two $\beta$'s: $\log_2(\frac{\beta_2}{\beta_1})$. A log ratio is used because it 
+makes the difference symmetrical: $\beta_2$ being twice as large leads to a log ratio of 1, while $\beta_1$ being twice as large results in -1.
+```{r}
+library(tidyr)
+
+beta_wide <- ap_topics %>%
+  mutate(topic = paste0("topic", topic)) %>%
+  pivot_wider(names_from = topic, values_from = beta) %>% 
+  # filter for relatively common words with beta > .001
+  filter(topic1 > .001 | topic2 > .001) %>%
+  mutate(log_ratio = log2(topic2 / topic1))
+
+beta_wide
+```
+
+
+### Document-topic probabilities
+LDA also models each document as a mixture of topics. We can examine the per-document-per-topics probabilities ($\gamma$) by setting the `matrix = 'gamma'` argument in `tidy()`. Each value is an estimated proportion of words from that documents that are generated from that topic. For document 1, about 25% of its words were generated from topic 1. 
+```{r}
+ap_documents <- tidy(ap_lda, matrix = "gamma")
+ap_documents
+```
+One interesting note we can see is that document 6 barely had any words from topic 1, so it is mostly generated from topic 2. We can take a closer look into the words that comprise the document.
+```{r}
+tidy(AssociatedPress) %>%
+  filter(document == 6) %>%
+  arrange(desc(count))
+```
+These words from document 6 look like they belong in the topic 2, which is about politics. 
+
+### Evaluation of Method
+To evaluate how efficient topic modeling is, we can have an example where we know the true grouping of documents and see if the algorithm will assign them to the correct cluster. We have chapters of four known books and want to re-assign them to the titles they belong to. We first start making the dataset with chapters and tokenizing all the chapters of each book.
+```{r}
+titles <- c("Twenty Thousand Leagues under the Sea", 
+            "The War of the Worlds",
+            "Pride and Prejudice", 
+            "Great Expectations")
+
+library(gutenbergr)
+library(stringr)
+
+books <- gutenberg_works(title %in% titles) %>%
+  gutenberg_download(meta_fields = "title")
+  
+# divide into documents, each representing one chapter
+by_chapter <- books %>%
+  group_by(title) %>%
+  mutate(chapter = cumsum(str_detect(
+    text, regex("chapter ", ignore_case = TRUE)
+  ))) %>%
+  ungroup() %>%
+  filter(chapter > 0) %>%
+  unite(document, title, chapter)
+
+# split into words
+by_chapter_word <- by_chapter %>%
+  unnest_tokens(word, text)
+
+# find document-word counts
+word_counts <- by_chapter_word %>%
+  anti_join(stop_words) %>%
+  count(document, word, sort = TRUE)
+
+word_counts
+```
+Now that we have a tidy data frame, we need to convert it to a Document Term Matrix in order to be inputted into the `topicmodels` package.
+```{r}
+chapters_dtm <- word_counts %>%
+  cast_dtm(document, word, n)
+
+chapters_dtm
+```
+Next, we create a four-topic model with k=4 with LDA because there are 4 books.
+```{r}
+chapters_lda <- LDA(chapters_dtm, k = 4, control = list(seed = 1234))
+chapters_lda
+```
+Then we can use `tidy()` to see the per-topic-per-word probabilities, of that term being generated from that topic in each row.
+```{r}
+chapter_topics <- tidy(chapters_lda, matrix = "beta")
+chapter_topics
+```
+Finding the top 5 terms within each topic:
+```{r}
+top_terms <- chapter_topics %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 5) %>% 
+  ungroup() %>%
+  arrange(topic, -beta)
+
+top_terms
+```
+Plotting the terms that are most common within each topic, we get:
+```{r}
+library(ggplot2)
+
+top_terms %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(beta, term, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  scale_y_reordered()
+```
+
+It looks like each topic has terms associated with one of the four books! It's pretty clear that “captain”, “nautilus”, “sea”, and “nemo” belongs to Twenty Thousand Leagues Under the Sea, and that “jane”, “darcy”, and “elizabeth” belongs to Pride and Prejudice, and we also see “pip” and “joe” from Great Expectations. As we saw before in this "fuzzy clustering," there are common words shared between topics, such as "miss." 
+
+What if we wanted to know which topics are associated with each document and put the chapters back together in their correct books? We can do this by examining the per-document-per-topic probabilities ($\gamma$), the estimated proportion of words from that document that are generated from that topic. For example, the model estimates that each word in Great Expectations_57 has 4% probability of being from topic 1.
+```{r}
+chapters_gamma <- tidy(chapters_lda, matrix = "gamma")
+chapters_gamma
+
+```
+Having these topic probabilities, we can see how well the unsupervised clustering did at distinguishing the four books. We would expect that chapters within a book would be found to be mostly (or entirely), generated from the corresponding topic. We re-separate the document name into title and chapter, then visualize the per-document-per-topic probability for each.
+```{r}
+chapters_gamma <- chapters_gamma %>%
+  separate(document, c("title", "chapter"), sep = "_", convert = TRUE)
+
+chapters_gamma
+```
+The gamma probabilities for each chapter within each book:
+```{r}
+chapters_gamma %>%
+  mutate(title = reorder(title, gamma * topic)) %>%
+  ggplot(aes(factor(topic), gamma)) +
+  geom_boxplot() +
+  facet_wrap(~ title) +
+  labs(x = "topic", y = expression(gamma))
+```
+
+Almost all of the chapters in the books were uniquely identified as one topic each: 1 for _Great Expectations_, 2 for _Pride and Prejudice_, 3 for _Twenty Thousand Leagues Under the Sea_. One thing we can note is that it looks like some chapters of _Great Expectations_ were somewhat associated with other topics. What if there were cases where the topic most associated with a chapter belonged to another book? We can find the topic that was most associated with each chapter as the classification of that chapter.
+```{r}
+chapter_classifications <- chapters_gamma %>%
+  group_by(title, chapter) %>%
+  slice_max(gamma) %>%
+  ungroup()
+
+chapter_classifications
+```
+We can then compare each to the most common topic among its chapters), and see which were most often misidentified.
+```{r}
+book_topics <- chapter_classifications %>%
+  count(title, topic) %>%
+  group_by(title) %>%
+  slice_max(n, n = 1) %>% 
+  ungroup() %>%
+  transmute(consensus = title, topic)
+
+chapter_classifications %>%
+  inner_join(book_topics, by = "topic") %>%
+  filter(title != consensus)
+```
+There is some misclassification for _Great Expectations_, but overall chapters were classified correctly.
+
+### Word Assignments
+One step of the LDA algorithm is assigning each word in each document to a topic. The more words in a document that are assigned to that topic, the more weight ($\gamma$) will usually go on that document-topic classification.
+
+We could take the original document-word pairs and find which words in each document were assigned to which topic. The `augment()` function from the `broom` package is a way of tidying model output. While `tidy()` retrieves the statistical components of the model, `augment()` uses the model to add information to each observation in the original data. The output of the function is a tidy data frame of book-term counts with an extra column `.topic`, where the topic each term was assigned to within each document. The `.` notation is default to prevent overwriting existing columns.
+```{r}
+assignments <- augment(chapters_lda, data = chapters_dtm)
+assignments
+```
+We could combine the assignments table with the consensus book titles to find which words were incorrectly classified.
+```{r}
+assignments <- assignments %>%
+  separate(document, c("title", "chapter"), 
+           sep = "_", convert = TRUE) %>%
+  inner_join(book_topics, by = c(".topic" = "topic"))
+
+assignments
+```
+Having the true label and the predicted label is using for further analysis, such as visualizing a confusion matrix to show how often words from one book were assigned to another.
+```{r}
+library(scales)
+
+assignments %>%
+  count(title, consensus, wt = count) %>%
+  mutate(across(c(title, consensus), ~str_wrap(., 20))) %>%
+  group_by(title) %>%
+  mutate(percent = n / sum(n)) %>%
+  ggplot(aes(consensus, title, fill = percent)) +
+  geom_tile() +
+  scale_fill_gradient2(high = "darkred", label = percent_format()) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        panel.grid = element_blank()) +
+  labs(x = "Book words were assigned to",
+       y = "Book words came from",
+       fill = "% of assignments")
+```
+
+We can see here for the most part the true book label and assigned label are generally pretty accurate except for the select _The War of Worlds_ chapters assigned to _Great Expectations_. To look into the most commonly mistaken words:
+```{r}
+wrong_words <- assignments %>%
+  filter(title != consensus)
+
+wrong_words %>%
+  count(title, consensus, term, wt = count) %>%
+  ungroup() %>%
+  arrange(desc(n))
+```
+We see a lot of words assigned to _The War of the Worlds_ even when they appeared in _Great Expectations_ because there are overlapping words between the two books. 
+The LDA algorithm is stochastic, meaning it uses randomness to find the optima of an objective function, and it can accidentally land on a topic that spans multiple books.
+
+In summary, we see how unsupervised clustering methods like topic modelings are useful for grouping documents in a more realistic manner.
+
+
+
+
+
+
